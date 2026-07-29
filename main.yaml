@@ -1,0 +1,1199 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Photo Uploader - highly available, containerized fullstack photo gallery on AWS
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: photo-uploader
+    Description: Prefix for all resource names
+
+  GitHubOrg:
+    Type: String
+    Description: GitHub organization or username (for OIDC trust policy)
+
+  GitHubAppRepo:
+    Type: String
+    Description: Application repository name (e.g. photo-uploader-app)
+
+  InitialImageUri:
+    Type: String
+    Description: Placeholder image URI for initial ECS task definition
+    Default: public.ecr.aws/docker/library/python:3.11-slim
+
+# ═══════════════════════════════════════════════════════════════════
+# VPC
+# ═══════════════════════════════════════════════════════════════════
+Resources:
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-vpc
+        - Key: Project
+          Value: !Ref EnvironmentName
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-igw
+
+  IGWAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # ── Public subnets (ALB) ──────────────────────────────────────────
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-public-1
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-public-2
+
+  # ── Private subnets (ECS tasks) ───────────────────────────────────
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.11.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-private-ecs-1
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.12.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-private-ecs-2
+
+  # ── Private data subnets (RDS) ────────────────────────────────────
+  DataSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.21.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-private-data-1
+
+  DataSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.22.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-private-data-2
+
+  # ── NAT Gateway (allows ECS tasks to pull initial image from public internet) ──
+  NatEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: IGWAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-nat-eip
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-nat
+
+  # ── Route tables ──────────────────────────────────────────────────
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-public-rt
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IGWAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RTAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RTAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-private-rt
+
+  PrivateNatRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnet1RTAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2RTAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  DataSubnet1RTAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref DataSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  DataSubnet2RTAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref DataSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+# ═══════════════════════════════════════════════════════════════════
+# Security Groups
+# ═══════════════════════════════════════════════════════════════════
+
+  VPCEndpointSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: HTTPS from VPC to interface endpoints
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 10.0.0.0/16
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-vpce-sg
+
+  ALBSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: HTTP inbound to ALB from internet
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-alb-sg
+
+  ECSSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: App port from ALB to ECS tasks
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5000
+          ToPort: 5000
+          SourceSecurityGroupId: !Ref ALBSG
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-ecs-sg
+
+  RDSSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: PostgreSQL from ECS tasks only
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref ECSSG
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-rds-sg
+
+# ═══════════════════════════════════════════════════════════════════
+# S3 Buckets
+# ═══════════════════════════════════════════════════════════════════
+
+  PhotosBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${EnvironmentName}-photos-${AWS::AccountId}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-photos
+        - Key: Project
+          Value: !Ref EnvironmentName
+
+  ArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${EnvironmentName}-artifacts-${AWS::AccountId}
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-artifacts
+        - Key: Project
+          Value: !Ref EnvironmentName
+
+# ═══════════════════════════════════════════════════════════════════
+# CloudFront (serves photos from private S3 via OAC)
+# ═══════════════════════════════════════════════════════════════════
+
+  CloudFrontOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub ${EnvironmentName}-oac
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        PriceClass: PriceClass_200
+        Comment: !Sub ${EnvironmentName} photo gallery
+        Origins:
+          - Id: S3Origin
+            DomainName: !GetAtt PhotosBucket.RegionalDomainName
+            OriginAccessControlId: !Ref CloudFrontOAC
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+          AllowedMethods: [GET, HEAD]
+          CachedMethods: [GET, HEAD]
+
+  PhotosBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref PhotosBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontOAC
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub arn:aws:s3:::${PhotosBucket}/*
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}
+
+# ═══════════════════════════════════════════════════════════════════
+# RDS PostgreSQL
+# ═══════════════════════════════════════════════════════════════════
+
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnet group for PostgreSQL
+      SubnetIds:
+        - !Ref DataSubnet1
+        - !Ref DataSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-db-subnet-group
+
+  DBSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub ${EnvironmentName}-db-credentials
+      Description: RDS PostgreSQL master credentials
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "photoadmin"}'
+        GenerateStringKey: password
+        PasswordLength: 20
+        ExcludeCharacters: '"@/\\'
+      Tags:
+        - Key: Project
+          Value: !Ref EnvironmentName
+
+  DBInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      DBInstanceIdentifier: !Sub ${EnvironmentName}-db
+      DBInstanceClass: db.t3.micro
+      Engine: postgres
+      # Major-only version: RDS selects the latest supported minor, avoiding
+      # stack-create failures when a specific minor (e.g. 15.4) is deprecated.
+      EngineVersion: '15'
+      DBName: photodb
+      MasterUsername: !Sub '{{resolve:secretsmanager:${DBSecret}:SecretString:username}}'
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${DBSecret}:SecretString:password}}'
+      AllocatedStorage: '20'
+      StorageType: gp2
+      StorageEncrypted: true
+      MultiAZ: false
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups:
+        - !Ref RDSSG
+      PubliclyAccessible: false
+      BackupRetentionPeriod: 1
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-db
+        - Key: Project
+          Value: !Ref EnvironmentName
+
+# ═══════════════════════════════════════════════════════════════════
+# ECR
+# ═══════════════════════════════════════════════════════════════════
+
+  ECRRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Ref EnvironmentName
+      ImageTagMutability: MUTABLE
+      LifecyclePolicy:
+        LifecyclePolicyText: >
+          {"rules":[{"rulePriority":1,"description":"Keep last 10 images",
+          "selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":10},
+          "action":{"type":"expire"}}]}
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-ecr
+
+# ═══════════════════════════════════════════════════════════════════
+# VPC Endpoints (ECR, S3, CloudWatch Logs, Secrets Manager)
+# ═══════════════════════════════════════════════════════════════════
+
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.s3
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PrivateRouteTable
+
+  ECRApiEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ecr.api
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref VPCEndpointSG
+      PrivateDnsEnabled: true
+
+  ECRDkrEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ecr.dkr
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref VPCEndpointSG
+      PrivateDnsEnabled: true
+
+  CloudWatchLogsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.logs
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref VPCEndpointSG
+      PrivateDnsEnabled: true
+
+  SecretsManagerEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.secretsmanager
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref VPCEndpointSG
+      PrivateDnsEnabled: true
+
+# ═══════════════════════════════════════════════════════════════════
+# IAM Roles
+# ═══════════════════════════════════════════════════════════════════
+
+  GitHubOIDCProvider:
+    Type: AWS::IAM::OIDCProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+      ThumbprintList:
+        - 6938fd4d98bab03faadb97b34396831e3780aea1
+
+  GitHubActionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${EnvironmentName}-github-actions-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Ref GitHubOIDCProvider
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike:
+                token.actions.githubusercontent.com:sub: !Sub repo:${GitHubOrg}/${GitHubAppRepo}:*
+      Policies:
+        - PolicyName: ECRAndArtifactsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:PutImage
+                Resource: !GetAtt ECRRepository.Arn
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource: !Sub ${ArtifactsBucket.Arn}/deploy/*
+
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${EnvironmentName}-ecs-execution-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: SecretsManagerAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref DBSecret
+
+  ECSTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${EnvironmentName}-ecs-task-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3PhotosAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:DeleteObject
+                Resource: !Sub arn:aws:s3:::${PhotosBucket}/*
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt PhotosBucket.Arn
+
+  CodeDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${EnvironmentName}-codedeploy-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codedeploy.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSCodeDeployRoleForECS
+
+  CodePipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${EnvironmentName}-codepipeline-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: PipelinePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:GetObjectVersion
+                  - s3:GetBucketVersioning
+                Resource:
+                  - !GetAtt ArtifactsBucket.Arn
+                  - !Sub ${ArtifactsBucket.Arn}/*
+              - Effect: Allow
+                Action:
+                  - codedeploy:CreateDeployment
+                  - codedeploy:GetDeployment
+                  - codedeploy:GetApplication
+                  - codedeploy:GetApplicationRevision
+                  - codedeploy:RegisterApplicationRevision
+                  - codedeploy:GetDeploymentConfig
+                  - ecs:RegisterTaskDefinition
+                  - ecs:DescribeTaskDefinition
+                Resource: '*'
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource:
+                  - !GetAtt ECSTaskExecutionRole.Arn
+                  - !GetAtt ECSTaskRole.Arn
+
+  EventBridgeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${EnvironmentName}-eventbridge-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StartPipelinePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: codepipeline:StartPipelineExecution
+                Resource: !Sub arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${EnvironmentName}-pipeline
+
+  SeedLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${EnvironmentName}-seed-lambda-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3WritePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !Sub ${ArtifactsBucket.Arn}/*
+
+# ═══════════════════════════════════════════════════════════════════
+# ECS Cluster, ALB, Task Definition, Service, Auto Scaling
+# ═══════════════════════════════════════════════════════════════════
+
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub ${EnvironmentName}-cluster
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-cluster
+        - Key: Project
+          Value: !Ref EnvironmentName
+
+  CloudWatchLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/${EnvironmentName}
+      RetentionInDays: 14
+
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub ${EnvironmentName}-alb
+      Scheme: internet-facing
+      Type: application
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref ALBSG
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-alb
+
+  BlueTG:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub ${EnvironmentName}-blue-tg
+      Port: 5000
+      Protocol: HTTP
+      TargetType: ip
+      VpcId: !Ref VPC
+      HealthCheckPath: /health
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-blue-tg
+
+  GreenTG:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub ${EnvironmentName}-green-tg
+      Port: 5000
+      Protocol: HTTP
+      TargetType: ip
+      VpcId: !Ref VPC
+      HealthCheckPath: /health
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-green-tg
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref BlueTG
+
+  ALBTestListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ALB
+      Port: 8080
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref GreenTG
+
+  ECSTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Ref EnvironmentName
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      Cpu: '256'
+      Memory: '512'
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ECSTaskRole.Arn
+      ContainerDefinitions:
+        - Name: photo-uploader
+          # Runs a minimal HTTP server on port 5000 that returns 200 for /health.
+          # Replaced by the real app image on first CodeDeploy blue/green deployment.
+          Image: !Ref InitialImageUri
+          Command:
+            - python3
+            - -c
+            - "from http.server import HTTPServer,BaseHTTPRequestHandler as B;T=type('H',(B,),{'do_GET':lambda s:(s.send_response(200),s.end_headers(),s.wfile.write(b'ok')),'log_message':lambda*a:None});HTTPServer(('',5000),T).serve_forever()"
+          PortMappings:
+            - ContainerPort: 5000
+              Protocol: tcp
+          Environment:
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: S3_BUCKET_NAME
+              Value: !Ref PhotosBucket
+            - Name: CLOUDFRONT_DOMAIN
+              Value: !GetAtt CloudFrontDistribution.DomainName
+            - Name: DB_PORT
+              Value: '5432'
+            - Name: DB_NAME
+              Value: photodb
+            - Name: DB_HOST
+              Value: !GetAtt DBInstance.Endpoint.Address
+          Secrets:
+            - Name: DB_PASSWORD
+              ValueFrom: !Sub '${DBSecret}:password::'
+            - Name: DB_USER
+              ValueFrom: !Sub '${DBSecret}:username::'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref CloudWatchLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+          Essential: true
+
+  ECSService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - ALBListener
+      - ALBTestListener
+    Properties:
+      ServiceName: !Sub ${EnvironmentName}-service
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref ECSTaskDefinition
+      LaunchType: FARGATE
+      DesiredCount: 1
+      HealthCheckGracePeriodSeconds: 120
+      DeploymentController:
+        Type: CODE_DEPLOY
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets:
+            - !Ref PrivateSubnet1
+            - !Ref PrivateSubnet2
+          SecurityGroups:
+            - !Ref ECSSG
+          AssignPublicIp: DISABLED
+      LoadBalancers:
+        - ContainerName: photo-uploader
+          ContainerPort: 5000
+          TargetGroupArn: !Ref BlueTG
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-service
+        - Key: Project
+          Value: !Ref EnvironmentName
+
+  AutoScalingTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    DependsOn: ECSService
+    Properties:
+      MaxCapacity: 4
+      MinCapacity: 1
+      ResourceId: !Sub service/${ECSCluster}/${EnvironmentName}-service
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+
+  AutoScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub ${EnvironmentName}-cpu-scaling
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref AutoScalingTarget
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 70.0
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        ScaleInCooldown: 60
+        ScaleOutCooldown: 60
+
+# ═══════════════════════════════════════════════════════════════════
+# Seed Lambda — creates static-artifacts.zip (appspec.yaml + taskdef.json)
+# GitHub Actions creates image-detail.zip (imageDetail.json)
+# ═══════════════════════════════════════════════════════════════════
+
+  SeedArtifactsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${EnvironmentName}-seed-artifacts
+      Runtime: python3.11
+      Handler: index.handler
+      Role: !GetAtt SeedLambdaRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          ARTIFACTS_BUCKET: !Ref ArtifactsBucket
+          EXEC_ROLE_ARN: !GetAtt ECSTaskExecutionRole.Arn
+          TASK_ROLE_ARN: !GetAtt ECSTaskRole.Arn
+          DB_SECRET_ARN: !Ref DBSecret
+          DB_HOST: !GetAtt DBInstance.Endpoint.Address
+          S3_BUCKET_NAME: !Ref PhotosBucket
+          CLOUDFRONT_DOMAIN: !GetAtt CloudFrontDistribution.DomainName
+          CW_LOG_GROUP: !Ref CloudWatchLogGroup
+          REGION: !Ref AWS::Region
+          ENV_NAME: !Ref EnvironmentName
+      Code:
+        ZipFile: |
+          import json, os, io, zipfile, boto3, cfnresponse
+
+          def handler(event, context):
+              if event.get('RequestType') == 'Delete':
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  return
+              try:
+                  env      = os.environ['ENV_NAME']
+                  bucket   = os.environ['ARTIFACTS_BUCKET']
+                  exec_arn = os.environ['EXEC_ROLE_ARN']
+                  task_arn = os.environ['TASK_ROLE_ARN']
+                  sec_arn  = os.environ['DB_SECRET_ARN']
+                  db_host  = os.environ['DB_HOST']
+                  s3_bkt   = os.environ['S3_BUCKET_NAME']
+                  cf_dom   = os.environ['CLOUDFRONT_DOMAIN']
+                  lg       = os.environ['CW_LOG_GROUP']
+                  region   = os.environ['REGION']
+
+                  taskdef = {
+                      "family": env,
+                      "networkMode": "awsvpc",
+                      "requiresCompatibilities": ["FARGATE"],
+                      "cpu": "256",
+                      "memory": "512",
+                      "executionRoleArn": exec_arn,
+                      "taskRoleArn": task_arn,
+                      "containerDefinitions": [{
+                          "name": "photo-uploader",
+                          "image": "<IMAGE1_NAME>",
+                          "portMappings": [{"containerPort": 5000, "protocol": "tcp"}],
+                          "environment": [
+                              {"name": "AWS_REGION",       "value": region},
+                              {"name": "S3_BUCKET_NAME",   "value": s3_bkt},
+                              {"name": "CLOUDFRONT_DOMAIN","value": cf_dom},
+                              {"name": "DB_PORT",          "value": "5432"},
+                              {"name": "DB_NAME",          "value": "photodb"},
+                              {"name": "DB_HOST",          "value": db_host}
+                          ],
+                          "secrets": [
+                              {"name": "DB_PASSWORD", "valueFrom": sec_arn + ":password::"},
+                              {"name": "DB_USER",     "valueFrom": sec_arn + ":username::"}
+                          ],
+                          "logConfiguration": {
+                              "logDriver": "awslogs",
+                              "options": {
+                                  "awslogs-group": lg,
+                                  "awslogs-region": region,
+                                  "awslogs-stream-prefix": "ecs"
+                              }
+                          },
+                          "essential": True
+                      }]
+                  }
+
+                  appspec = (
+                      "version: 0.0\n"
+                      "Resources:\n"
+                      "  - TargetService:\n"
+                      "      Type: AWS::ECS::Service\n"
+                      "      Properties:\n"
+                      "        TaskDefinition: <TASK_DEFINITION>\n"
+                      "        LoadBalancerInfo:\n"
+                      "          ContainerName: \"photo-uploader\"\n"
+                      "          ContainerPort: 5000\n"
+                      "        PlatformVersion: \"LATEST\"\n"
+                  )
+
+                  # Create in-memory ZIP with both deployment files
+                  buf = io.BytesIO()
+                  with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+                      zf.writestr('taskdef.json', json.dumps(taskdef, indent=2))
+                      zf.writestr('appspec.yaml', appspec)
+                  buf.seek(0)
+
+                  s3 = boto3.client('s3')
+                  s3.put_object(
+                      Bucket=bucket,
+                      Key='deploy/static-artifacts.zip',
+                      Body=buf.getvalue(),
+                      ContentType='application/zip'
+                  )
+
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as e:
+                  print(e)
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+
+  SeedArtifactsCustomResource:
+    Type: Custom::SeedArtifacts
+    DependsOn:
+      - DBInstance
+      - CloudFrontDistribution
+      - ECSTaskExecutionRole
+      - ECSTaskRole
+      - ArtifactsBucket
+    Properties:
+      ServiceToken: !GetAtt SeedArtifactsFunction.Arn
+      SchemaVersion: '2'
+
+# ═══════════════════════════════════════════════════════════════════
+# CodeDeploy (ECS blue/green)
+# ═══════════════════════════════════════════════════════════════════
+
+  CodeDeployApplication:
+    Type: AWS::CodeDeploy::Application
+    Properties:
+      ApplicationName: !Sub ${EnvironmentName}-app
+      ComputePlatform: ECS
+
+  CodeDeployDeploymentGroup:
+    Type: AWS::CodeDeploy::DeploymentGroup
+    DependsOn: ECSService
+    Properties:
+      ApplicationName: !Ref CodeDeployApplication
+      DeploymentGroupName: !Sub ${EnvironmentName}-dg
+      ServiceRoleArn: !GetAtt CodeDeployRole.Arn
+      DeploymentConfigName: CodeDeployDefault.ECSAllAtOnce
+      DeploymentStyle:
+        DeploymentType: BLUE_GREEN
+        DeploymentOption: WITH_TRAFFIC_CONTROL
+      BlueGreenDeploymentConfiguration:
+        TerminateBlueInstancesOnDeploymentSuccess:
+          Action: TERMINATE
+          TerminationWaitTimeInMinutes: 5
+        DeploymentReadyOption:
+          ActionOnTimeout: CONTINUE_DEPLOYMENT
+          WaitTimeInMinutes: 0
+      ECSServices:
+        - ClusterName: !Ref ECSCluster
+          ServiceName: !Sub ${EnvironmentName}-service
+      LoadBalancerInfo:
+        TargetGroupPairInfoList:
+          - TargetGroups:
+              - Name: !GetAtt BlueTG.TargetGroupName
+              - Name: !GetAtt GreenTG.TargetGroupName
+            ProdTrafficRoute:
+              ListenerArns:
+                - !Ref ALBListener
+            TestTrafficRoute:
+              ListenerArns:
+                - !Ref ALBTestListener
+
+# ═══════════════════════════════════════════════════════════════════
+# CodePipeline
+# Sources:
+#   - S3 static-artifacts.zip  (appspec.yaml + taskdef.json, seeded by Lambda)
+#   - S3 image-detail.zip      (imageDetail.json, uploaded by GitHub Actions)
+# Deploy: CodeDeployToECS blue/green
+# ═══════════════════════════════════════════════════════════════════
+
+  DeploymentPipeline:
+    Type: AWS::CodePipeline::Pipeline
+    DependsOn:
+      - SeedArtifactsCustomResource
+      - CodeDeployDeploymentGroup
+    Properties:
+      Name: !Sub ${EnvironmentName}-pipeline
+      RoleArn: !GetAtt CodePipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactsBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: StaticArtifacts
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: S3
+                Version: '1'
+              Configuration:
+                S3Bucket: !Ref ArtifactsBucket
+                S3ObjectKey: deploy/static-artifacts.zip
+                PollForSourceChanges: 'false'
+              OutputArtifacts:
+                - Name: StaticArtifacts
+              RunOrder: 1
+            - Name: ImageDetail
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: S3
+                Version: '1'
+              Configuration:
+                S3Bucket: !Ref ArtifactsBucket
+                S3ObjectKey: deploy/image-detail.zip
+                PollForSourceChanges: 'false'
+              OutputArtifacts:
+                - Name: ImageArtifact
+              RunOrder: 1
+        - Name: Deploy
+          Actions:
+            - Name: BlueGreenDeploy
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CodeDeployToECS
+                Version: '1'
+              Configuration:
+                ApplicationName: !Ref CodeDeployApplication
+                DeploymentGroupName: !Sub ${EnvironmentName}-dg
+                TaskDefinitionTemplateArtifact: StaticArtifacts
+                TaskDefinitionTemplatePath: taskdef.json
+                AppSpecTemplateArtifact: StaticArtifacts
+                AppSpecTemplatePath: appspec.yaml
+                Image1ArtifactName: ImageArtifact
+                Image1ContainerName: IMAGE1_NAME
+              InputArtifacts:
+                - Name: StaticArtifacts
+                - Name: ImageArtifact
+              RunOrder: 1
+
+# ═══════════════════════════════════════════════════════════════════
+# EventBridge — detects ECR image push → triggers CodePipeline
+# ═══════════════════════════════════════════════════════════════════
+
+  ECRPushRule:
+    Type: AWS::Events::Rule
+    DependsOn: DeploymentPipeline
+    Properties:
+      Name: !Sub ${EnvironmentName}-ecr-push
+      Description: Trigger CodePipeline when a new image is pushed to ECR
+      EventPattern:
+        source:
+          - aws.ecr
+        detail-type:
+          - ECR Image Action
+        detail:
+          action-type:
+            - PUSH
+          result:
+            - SUCCESS
+          repository-name:
+            - !Ref EnvironmentName
+      State: ENABLED
+      Targets:
+        - Id: TriggerPipeline
+          Arn: !Sub arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${EnvironmentName}-pipeline
+          RoleArn: !GetAtt EventBridgeRole.Arn
+
+# ═══════════════════════════════════════════════════════════════════
+# Outputs
+# ═══════════════════════════════════════════════════════════════════
+
+Outputs:
+
+  ALBEndpoint:
+    Description: Access the photo gallery at this URL
+    Value: !Sub http://${ALB.DNSName}
+
+  ECRRepositoryUri:
+    Description: ECR repository URI
+    Value: !GetAtt ECRRepository.RepositoryUri
+
+  ECRRepositoryName:
+    Description: ECR repository name — use as GitHub secret ECR_REPOSITORY_NAME
+    Value: !Ref EnvironmentName
+
+  GitHubActionsRoleArn:
+    Description: OIDC IAM role ARN — use as GitHub secret AWS_ROLE_ARN
+    Value: !GetAtt GitHubActionsRole.Arn
+
+  ArtifactsBucketName:
+    Description: S3 artifacts bucket name — use as GitHub secret ARTIFACTS_BUCKET_NAME
+    Value: !Ref ArtifactsBucket
+
+  CloudFrontDomain:
+    Description: CloudFront distribution domain (images are served from here)
+    Value: !GetAtt CloudFrontDistribution.DomainName
+
+  DBSecretArn:
+    Description: Secrets Manager ARN for RDS credentials
+    Value: !Ref DBSecret
+
+  ECSClusterName:
+    Description: ECS cluster name
+    Value: !Ref ECSCluster

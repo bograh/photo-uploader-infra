@@ -1,0 +1,13 @@
+{
+  "Parameters": {
+    "EnvironmentName": "photo-uploader",
+    "GitHubOrg": "YOUR_GITHUB_USERNAME_OR_ORG",
+    "GitHubAppRepo": "photo-uploader-app",
+    "InitialImageUri": "public.ecr.aws/docker/library/python:3.11-slim"
+  },
+  "Tags": {
+    "Project": "PhotoUploader",
+    "Environment": "lab",
+    "ManagedBy": "CloudFormation-GitSync"
+  }
+}
