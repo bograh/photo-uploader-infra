@@ -1,11 +1,12 @@
 {
-  "Parameters": {
+  "template-file-path": "main.yaml",
+  "parameters": {
     "EnvironmentName": "photo-uploader",
     "GitHubOrg": "bograh",
     "GitHubAppRepo": "photo-uploader-app",
     "InitialImageUri": "public.ecr.aws/docker/library/python:3.11-slim"
   },
-  "Tags": {
+  "tags": {
     "Project": "PhotoUploader",
     "Environment": "lab",
     "ManagedBy": "CloudFormation-GitSync"
