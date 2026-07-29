@@ -1,7 +1,7 @@
 {
   "Parameters": {
     "EnvironmentName": "photo-uploader",
-    "GitHubOrg": "YOUR_GITHUB_USERNAME_OR_ORG",
+    "GitHubOrg": "bograh",
     "GitHubAppRepo": "photo-uploader-app",
     "InitialImageUri": "public.ecr.aws/docker/library/python:3.11-slim"
   },
