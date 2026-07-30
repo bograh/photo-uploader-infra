@@ -913,11 +913,29 @@ Resources:
           ENV_NAME: !Ref EnvironmentName
       Code:
         ZipFile: |
-          import json, os, io, zipfile, boto3, cfnresponse
+          import json, os, io, zipfile, boto3, urllib.request
+
+          # Self-contained CloudFormation custom-resource responder.
+          # The auto-injected `cfnresponse` module is not always present in the
+          # python3.11 runtime, so we PUT the response to the pre-signed URL directly.
+          def respond(event, context, status, data=None):
+              body = json.dumps({
+                  'Status': status,
+                  'Reason': 'See CloudWatch log stream: ' + context.log_stream_name,
+                  'PhysicalResourceId': context.log_stream_name,
+                  'StackId': event['StackId'],
+                  'RequestId': event['RequestId'],
+                  'LogicalResourceId': event['LogicalResourceId'],
+                  'Data': data or {}
+              }).encode('utf-8')
+              req = urllib.request.Request(event['ResponseURL'], data=body, method='PUT')
+              req.add_header('content-type', '')
+              req.add_header('content-length', str(len(body)))
+              urllib.request.urlopen(req)
 
           def handler(event, context):
               if event.get('RequestType') == 'Delete':
-                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  respond(event, context, 'SUCCESS')
                   return
               try:
                   env      = os.environ['ENV_NAME']
@@ -995,10 +1013,10 @@ Resources:
                       ContentType='application/zip'
                   )
 
-                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  respond(event, context, 'SUCCESS')
               except Exception as e:
                   print(e)
-                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+                  respond(event, context, 'FAILED', {'Error': str(e)})
 
   SeedArtifactsCustomResource:
     Type: Custom::SeedArtifacts
