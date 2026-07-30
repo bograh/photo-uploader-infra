@@ -497,15 +497,8 @@ Resources:
 # IAM Roles
 # ═══════════════════════════════════════════════════════════════════
 
-  GitHubOIDCProvider:
-    Type: AWS::IAM::OIDCProvider
-    Properties:
-      Url: https://token.actions.githubusercontent.com
-      ClientIdList:
-        - sts.amazonaws.com
-      ThumbprintList:
-        - 6938fd4d98bab03faadb97b34396831e3780aea1
-
+  # The account already has a GitHub Actions OIDC provider (only one per account
+  # is allowed), so we reference its ARN instead of creating a duplicate.
   GitHubActionsRole:
     Type: AWS::IAM::Role
     Properties:
@@ -515,7 +508,7 @@ Resources:
         Statement:
           - Effect: Allow
             Principal:
-              Federated: !Ref GitHubOIDCProvider
+              Federated: !Sub arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com
             Action: sts:AssumeRoleWithWebIdentity
             Condition:
               StringEquals:
