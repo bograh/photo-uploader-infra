@@ -514,7 +514,12 @@ Resources:
               StringEquals:
                 token.actions.githubusercontent.com:aud: sts.amazonaws.com
               StringLike:
-                token.actions.githubusercontent.com:sub: !Sub repo:${GitHubOrg}/${GitHubAppRepo}:*
+                # GitHub now issues immutable subject claims that append the numeric
+                # owner/repo IDs (repo:owner@<ownerid>/repo@<repoid>:...). Accept both
+                # the plain and immutable forms so auth works regardless of format.
+                token.actions.githubusercontent.com:sub:
+                  - !Sub repo:${GitHubOrg}/${GitHubAppRepo}:*
+                  - !Sub repo:${GitHubOrg}@*/${GitHubAppRepo}@*:*
       Policies:
         - PolicyName: ECRAndArtifactsPolicy
           PolicyDocument:
